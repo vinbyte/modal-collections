@@ -127,11 +127,3 @@ modal deploy vllm/serve.py
 ```
 
 See [`vllm/README.md`](vllm/README.md) for full API usage examples and configuration details.
-
-## Adding a New App
-
-1. Create a new folder: `mkdir my-app`
-2. Add your entrypoint: `my-app/my_app.py`
-3. Run or deploy: `modal serve my-app/my_app.py`
-
-No changes to this README needed — each app is fully independent.
