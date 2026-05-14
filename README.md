@@ -9,7 +9,9 @@ modal-collections/
 ├── wan2gp/          # Wan2GP video generation (Gradio)
 │   ├── wan2gp.py
 │   └── .venv/       # (optional, for local IDE support)
-├── <future-app>/    # more apps coming soon
+├── vllm/            # vLLM LLM inference (OpenAI-compatible API)
+│   ├── serve.py
+│   └── README.md
 └── README.md
 ```
 
@@ -100,6 +102,31 @@ modal deploy wan2gp/wan2gp.py
 ```
 
 Modal will print the Gradio URL after the container starts.
+
+## App: vLLM
+
+OpenAI-compatible LLM inference server using vLLM, currently running Qwen3.6-27B AWQ INT4 (4-bit quantized, ~21 GB VRAM) with vision + reasoning support on an A100 80GB GPU at full 262K context length.
+
+- **Image**: NVIDIA CUDA 12.9 + vLLM 0.19.0 + transformers 5.5.0
+- **GPU**: A100-80GB (1x)
+- **Model**: cyankiwi/Qwen3.6-27B-AWQ-INT4 (AWQ 4-bit, ~21 GB VRAM, full 262K context)
+- **Storage**: `huggingface-cache` + `vllm-cache` Modal Volumes (model weights and JIT cache persist across restarts)
+- **Endpoint**: OpenAI-compatible API on port 8000 (`/v1/chat/completions`, `/v1/completions`, `/v1/models`)
+
+### Quick test
+
+```bash
+modal run vllm/serve.py
+modal run vllm/serve.py --content "What is the meaning of life?"
+```
+
+### Deploy
+
+```bash
+modal deploy vllm/serve.py
+```
+
+See [`vllm/README.md`](vllm/README.md) for full API usage examples and configuration details.
 
 ## Adding a New App
 
