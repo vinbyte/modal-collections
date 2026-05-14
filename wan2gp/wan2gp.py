@@ -2,17 +2,20 @@
 Wan2GP on Modal — Deploys the Wan2GP video generation Gradio app to Modal.
 
 Architecture:
-  - Modal builds a container image with PyTorch, xformers, and Wan2GP dependencies.
-  - At container startup, the Wan2GP repo's data dirs (ckpts, loras, outputs) are
-    symlinked into a persistent Modal Volume so checkpoints and outputs survive
-    across restarts.
-  - The wgp module is imported in-process and its Gradio Blocks app is exposed
-    via @modal.asgi_app() (no subprocess, no HTTP proxy — avoids Content-Length
-    mismatch errors that occur with @modal.web_server() on streaming/SSE responses).
+  - Modal builds a container image with PyTorch, xformers, and Wan2GP deps.
+  - At container startup, data dirs (ckpts, loras, outputs) are symlinked into
+    a persistent Modal Volume so checkpoints and outputs survive restarts.
+  - wgp.py is launched as a subprocess with Gradio's --share flag, which
+    creates a public tunnel URL (*.gradio.live) that bypasses Modal's HTTP
+    proxy. This avoids Content-Length mismatch errors that occur when Gradio
+    streams responses (SSE, progressive loading) through Modal's reverse proxy.
+  - Modal's @modal.web_server is still used to keep the container alive and
+    provide a fallback URL, but the primary access is via the Gradio share URL
+    printed in the logs.
 
 Usage:
   modal serve wan2gp/wan2gp.py   # dev mode, logs in terminal
-  modal deploy wan2gp/wan2gp.py  # production, persistent URL
+  modal deploy wan2gp/wan2gp.py  # production, persistent
 """
 
 import logging
@@ -38,10 +41,11 @@ logger = logging.getLogger("wan2gp")
 # See https://modal.com/pricing for details.
 GPU_TYPE = "A100-80GB"
 TIMEOUT = 3600  # max seconds a container stays alive
-MAX_CONCURRENT_INPUTS = 10  # max concurrent requests per container
-GRADIO_PORT = 7860  # unused with asgi_app, kept for reference
+MAX_CONCURRENT_INPUTS = 3  # max concurrent requests per container
+GRADIO_PORT = 7860  # port Gradio listens on inside the container
 WAN2GP_PROFILE = "1"  # offloading profile: 1 = high VRAM
 STARTUP_TIMEOUT = 300  # seconds Modal waits for the container to be ready
+GRADIO_SHARE = True  # create a public *.gradio.live tunnel URL
 
 # ── Paths ───────────────────────────────────────────────────────────────────
 WAN2GP_ROOT = "/root/Wan2GP"  # cloned repo location inside container
@@ -87,15 +91,6 @@ wan2gp_image = (
         f"sed -i \"s/matplotlib.use('TkAgg')/matplotlib.use('Agg')/\" "
         f"{WAN2GP_ROOT}/preprocessing/matanyone/tools/interact_tools.py || true",
     )
-    # Patch 2–4: Gradio Dropdown.input() fires on text input in the search
-    # box, not on selection. This breaks cascading dropdowns (e.g. switching
-    # model family doesn't update the model version dropdown). Switch to
-    # .change() which fires when the user actually selects an option.
-    .run_commands(
-        f"sed -i 's/model_family.input(fn=change_model_family/model_family.change(fn=change_model_family/' {WAN2GP_ROOT}/wgp.py",
-        f"sed -i 's/model_base_type_choice.input(fn=change_model_base_types/model_base_type_choice.change(fn=change_model_base_types/' {WAN2GP_ROOT}/wgp.py",
-        f"sed -i 's/prompt_enhancer_mode_dropdown.input(fn=/prompt_enhancer_mode_dropdown.change(fn=/' {WAN2GP_ROOT}/wgp.py",
-    )
 )
 
 # ── Persistent storage ─────────────────────────────────────────────────────
@@ -112,20 +107,22 @@ app = modal.App("wan2gp")
     gpu=GPU_TYPE,
     volumes={VOL_MOUNT: wan2gp_volume},
     timeout=TIMEOUT,
+    min_containers=1,  # always keep 1 container running so Gradio share URL stays alive
 )
 @modal.concurrent(max_inputs=MAX_CONCURRENT_INPUTS)
 class Wan2GP:
     """Modal class that runs Wan2GP's Gradio interface.
 
     Lifecycle:
-      1. @modal.enter() setup() — prepare volumes, env vars, import wgp
-      2. @modal.asgi_app() serve() — return Gradio's ASGI app directly
+      1. @modal.enter() setup() — prepare volumes, env vars
+      2. @modal.web_server() launch() — start wgp.py as a subprocess
+      3. User accesses the app via the Gradio share URL (*.gradio.live)
+         printed in the container logs (NOT the Modal URL)
     """
 
     @modal.enter()
     def setup(self):
-        """Run once when a new container starts. Prepares the environment and
-        imports the Wan2GP Gradio app in-process."""
+        """Run once when a new container starts. Prepares the environment."""
         t_start = time.monotonic()
         logger.info("=== Wan2GP container startup ===")
         logger.info(
@@ -153,11 +150,95 @@ class Wan2GP:
         # Disable Gradio telemetry
         os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
 
-        # Import wgp and create the Gradio Blocks app in-process
-        self._init_wgp()
-
         elapsed = time.monotonic() - t_start
         logger.info("=== Setup complete in %.1fs ===", elapsed)
+
+    @modal.web_server(GRADIO_PORT, startup_timeout=STARTUP_TIMEOUT)
+    def launch(self):
+        """Start wgp.py as a subprocess with Gradio's --share flag.
+
+        Gradio's --share creates a public tunnel URL (*.gradio.live) that
+        connects directly to the Gradio server without going through Modal's
+        HTTP reverse proxy. This avoids Content-Length mismatch errors that
+        occur when Gradio streams responses (SSE, progressive loading, file
+        uploads) through the proxy.
+
+        The Modal URL still works as a fallback, but may encounter the
+        proxy-related errors. Always use the Gradio share URL for the best
+        experience. The URL is printed in the container logs after startup.
+        """
+        logger.info(
+            "=== Launching Wan2GP Gradio on port %d (startup_timeout=%ds) ===",
+            GRADIO_PORT,
+            STARTUP_TIMEOUT,
+        )
+        logger.info("Profile: %s | CWD: %s", WAN2GP_PROFILE, WAN2GP_ROOT)
+
+        cmd = [
+            sys.executable,
+            "-u",  # unbuffered stdout/stderr for real-time logging
+            "wgp.py",
+            "--listen",  # bind to 0.0.0.0
+            "--server-port",
+            str(GRADIO_PORT),
+            "--profile",
+            WAN2GP_PROFILE,
+        ]
+        # --share creates a public *.gradio.live tunnel URL that bypasses
+        # Modal's HTTP proxy, avoiding Content-Length mismatch on streaming
+        if GRADIO_SHARE:
+            cmd.append("--share")
+
+        logger.info("Command: %s", " ".join(cmd))
+
+        proc = subprocess.Popen(
+            cmd,
+            cwd=WAN2GP_ROOT,
+            env=self.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,  # line-buffered for real-time log streaming
+        )
+        logger.info("wgp.py PID: %d", proc.pid)
+
+        # Stream wgp.py output to structured logs so Gradio share URL,
+        # errors, and model loading progress are visible in Modal logs
+        self._stream_wgp_output(proc)
+
+    def _stream_wgp_output(self, proc):
+        """Stream subprocess output to structured logs in a daemon thread.
+
+        Routes lines to the appropriate log level:
+          - INFO: Gradio URLs, model downloads/loading progress
+          - ERROR: tracebacks, exceptions, errors
+          - DEBUG: everything else (routine Gradio noise)
+        """
+        import threading
+
+        def _reader():
+            for line in proc.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+                # Gradio share URL and server startup messages
+                if "Running on" in line or "gradio.live" in line:
+                    logger.info("GRADIO: %s", line)
+                # Error-class lines that need attention
+                elif any(
+                    kw in line.lower() for kw in ("error", "exception", "traceback")
+                ):
+                    logger.error("WGP: %s", line)
+                # Useful progress info (model download, loading, etc.)
+                elif any(kw in line.lower() for kw in ("download", "loading", "model")):
+                    logger.info("WGP: %s", line)
+                else:
+                    logger.debug("WGP: %s", line)
+
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+
+    # ── Volume & environment helpers ──────────────────────────────────────
 
     def _prepare_volume_dirs(self):
         """Create the directory structure inside the persistent volume."""
@@ -199,86 +280,14 @@ class Wan2GP:
             "TORCH_HOME": str(wan_cache_dir / "torch"),
             "XDG_CACHE_HOME": str(wan_cache_dir / ".cache"),
         }
-        # Set on both self.env (for any subprocess use) and os.environ (for
-        # the in-process import of wgp, which reads env vars at module level)
         self.env = os.environ.copy()
         self.env.update(cache_env)
+        # Also set on os.environ for any in-process code that reads env vars
         os.environ.update(cache_env)
         for k, v in cache_env.items():
             logger.info("Env %s=%s", k, v)
 
-    def _init_wgp(self):
-        """Import the Wan2GP wgp module in-process and create the Gradio UI.
-
-        This is the key trick: instead of running wgp.py as a subprocess (which
-        requires @modal.web_server and its HTTP proxy), we import it directly.
-        This lets us return demo.app (the ASGI/FastAPI app) via @modal.asgi_app()
-        which bypasses the proxy and avoids Content-Length mismatch errors on
-        streaming/SSE responses.
-
-        wgp.py reads sys.argv and does heavy module-level init (CUDA detection,
-        model registry, etc.), so we:
-          1. Set sys.argv to simulate "wgp.py --profile 1 --listen"
-          2. chdir into the repo root so relative imports work
-          3. Add the repo root to sys.path
-          4. Create WAN2GPApplication (normally done in __main__) so that
-             create_ui() can call app.initialize_plugins()
-        """
-        logger.info("=== Importing wgp module (profile=%s) ===", WAN2GP_PROFILE)
-
-        original_argv = sys.argv
-        original_cwd = os.getcwd()
-        sys.argv = ["wgp.py", "--profile", WAN2GP_PROFILE, "--listen"]
-        os.chdir(WAN2GP_ROOT)
-        if WAN2GP_ROOT not in sys.path:
-            sys.path.insert(0, WAN2GP_ROOT)
-
-        try:
-            import wgp
-
-            self._wgp = wgp
-            logger.info("wgp module imported successfully")
-
-            # download_ffmpeg() is normally called in __main__ before launch
-            try:
-                from shared.ffmpeg_setup import download_ffmpeg
-
-                download_ffmpeg()
-                logger.info("FFmpeg setup complete")
-            except Exception as e:
-                logger.warning("FFmpeg setup skipped: %s", e)
-
-            # Remove stale startup lock (left behind if a previous run crashed)
-            wgp.clear_startup_lock()
-
-            # wgp.app is set to None at module level and normally initialized
-            # in the __main__ block. Since we import (not run) the module, we
-            # must set it up manually before create_ui() references it.
-            from shared.utils.plugins import WAN2GPApplication
-
-            wgp.app = WAN2GPApplication()
-            logger.info("WAN2GPApplication initialized")
-
-            logger.info("=== Creating Gradio UI ===")
-            self._demo = wgp.create_ui()
-            logger.info("Gradio UI created successfully")
-        except Exception:
-            logger.exception("Failed to initialize wgp module")
-            raise
-        finally:
-            sys.argv = original_argv
-            os.chdir(original_cwd)
-
-    @modal.asgi_app()
-    def serve(self):
-        """Return the Gradio ASGI app directly (no subprocess, no HTTP proxy).
-
-        Using @modal.asgi_app instead of @modal.web_server avoids the
-        Content-Length mismatch errors that occur when Gradio streams
-        responses (SSE / progressive loading) through Modal's HTTP proxy.
-        """
-        logger.info("Returning Gradio ASGI app")
-        return self._demo.app
+    # ── Diagnostics ───────────────────────────────────────────────────────
 
     @staticmethod
     def _log_gpu_info():
@@ -326,6 +335,8 @@ class Wan2GP:
                 )
         except ImportError:
             logger.warning("torch not importable at setup time")
+
+    # ── Symlink helper ────────────────────────────────────────────────────
 
     @staticmethod
     def _merge_and_link(repo_path: Path, vol_dir: Path):
