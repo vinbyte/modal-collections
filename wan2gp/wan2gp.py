@@ -36,16 +36,16 @@ logging.basicConfig(
 logger = logging.getLogger("wan2gp")
 
 # ── Runtime config ──────────────────────────────────────────────────────────
-# Available GPU types: T4, L4, A10, L40S, A100, A100-40GB, A100-80GB,
-# RTX-PRO-6000, H100, H100!, H200, B200, B200+
+# Available GPU types: T4, L4, A10, L40S, A100, A100-40GB, A100-80GB, RTX-PRO-6000, H100, H200, B200
 # See https://modal.com/pricing for details.
-GPU_TYPE = "A100-80GB"
+GPU_TYPE = "L40S"
 TIMEOUT = 3600  # max seconds a container stays alive
 MAX_CONCURRENT_INPUTS = 3  # max concurrent requests per container
 GRADIO_PORT = 7860  # port Gradio listens on inside the container
 WAN2GP_PROFILE = "1"  # offloading profile: 1 = high VRAM
 STARTUP_TIMEOUT = 300  # seconds Modal waits for the container to be ready
 GRADIO_SHARE = True  # create a public *.gradio.live tunnel URL
+ENABLE_MEMORY_SNAPSHOT = True  # enable Modal memory snapshotting for faster restarts
 
 # ── Paths ───────────────────────────────────────────────────────────────────
 WAN2GP_ROOT = "/root/Wan2GP"  # cloned repo location inside container
@@ -108,6 +108,7 @@ app = modal.App("wan2gp")
     volumes={VOL_MOUNT: wan2gp_volume},
     timeout=TIMEOUT,
     min_containers=1,  # always keep 1 container running so Gradio share URL stays alive
+    enable_memory_snapshot=ENABLE_MEMORY_SNAPSHOT,
 )
 @modal.concurrent(max_inputs=MAX_CONCURRENT_INPUTS)
 class Wan2GP:
