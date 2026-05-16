@@ -3,3 +3,4 @@ huggingface_hub
 starlette
 httpx
 uvicorn
+websockets

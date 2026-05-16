@@ -383,19 +383,34 @@ class ComfyUI:
 
     @modal.enter(snap=False)
     def start_restore(self) -> None:
-        """Warm start: restore from GPU snapshot."""
+        """Warm start: restart proxy after GPU snapshot restore.
+
+        GPU snapshots can leave asyncio-based subprocesses (uvicorn/starlette)
+        in a frozen state — TCP socket stays open but the event loop stalls.
+        ComfyUI survives fine; we only restart the proxy.
+        """
         logger.info("=== ComfyUI restore from snapshot ===")
         wait_for_port(COMFY_PORT, timeout=30)
-        wait_for_port(PROXY_PORT, timeout=30)
+
+        # Kill frozen proxy from snapshot, then restart
+        old_proxy = getattr(self, "proxy_proc", None)
+        if old_proxy is not None:
+            try:
+                old_proxy.terminate()
+                old_proxy.wait(timeout=5)
+            except (ProcessLookupError, OSError, subprocess.TimeoutExpired):
+                try:
+                    old_proxy.kill()
+                except Exception:
+                    pass
+
+        self._start_proxy()
         logger.info("=== restore complete ===")
 
     @modal.web_server(PROXY_PORT, startup_timeout=STARTUP_TIMEOUT)
     def proxy(self) -> None:
         """Placeholder — proxy runs as subprocess from start_checkpoint."""
-        import time
         logger.info("=== proxy web_server active ===")
-        while True:
-            time.sleep(86400)
 
     @modal.exit()
     def cleanup(self) -> None:
@@ -511,10 +526,12 @@ from collections import OrderedDict
 from copy import deepcopy
 
 import httpx
+import websockets
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import StreamingResponse, JSONResponse
-from starlette.routing import Route
+from starlette.routing import Route, WebSocketRoute
+from starlette.websockets import WebSocket
 
 logging.basicConfig(
     level=logging.INFO,
@@ -730,20 +747,27 @@ async def proxy_all(request):
     if qs:
         url = url + "?" + qs
 
+    # Preserve Host/Origin chain for ComfyUI security checks.
+    # ComfyUI can return 403 for static assets when Host/Origin mismatch.
     headers = {
         k: v for k, v in request.headers.items()
-        if k.lower() not in ("host",)
+        if k.lower() not in ("connection", "transfer-encoding", "content-length")
     }
-    body = await request.body()
+    headers["X-Forwarded-Host"] = request.headers.get("host", "")
+    headers["X-Forwarded-Proto"] = request.url.scheme
+
+    # Only read body for methods that send one
+    body = await request.body() if request.method in ("POST", "PUT", "PATCH") else None
 
     async with httpx.AsyncClient(timeout=300.0) as client:
-        resp = await client.request(
+        req = client.build_request(
             request.method, url, headers=headers, content=body,
         )
+        resp = await client.send(req)
 
     r_headers = {
         k: v for k, v in resp.headers.items()
-        if k.lower() not in ("transfer-encoding", "content-length")
+        if k.lower() not in ("transfer-encoding", "content-length", "content-encoding")
     }
 
     return StreamingResponse(
@@ -754,12 +778,47 @@ async def proxy_all(request):
     )
 
 
+async def proxy_ws(websocket: WebSocket):
+    """Proxy ComfyUI websocket endpoint (/ws)."""
+    await websocket.accept()
+
+    uri = f"ws://127.0.0.1:{COMFY_PORT}/ws"
+    if websocket.url.query:
+        uri = uri + "?" + websocket.url.query
+
+    try:
+        async with websockets.connect(uri) as upstream:
+            async def client_to_upstream():
+                while True:
+                    msg = await websocket.receive()
+                    if msg["type"] == "websocket.disconnect":
+                        await upstream.close()
+                        return
+                    if msg.get("text") is not None:
+                        await upstream.send(msg["text"])
+                    elif msg.get("bytes") is not None:
+                        await upstream.send(msg["bytes"])
+
+            async def upstream_to_client():
+                async for msg in upstream:
+                    if isinstance(msg, bytes):
+                        await websocket.send_bytes(msg)
+                    else:
+                        await websocket.send_text(msg)
+
+            await asyncio.gather(client_to_upstream(), upstream_to_client())
+    except Exception as e:
+        logger.warning("websocket proxy error: %s", e)
+        await websocket.close(code=1011)
+
+
 # ── App ──────────────────────────────────────────────────────────────────────
 
 app = Starlette(routes=[
     Route("/v1/video/generations", create_video, methods=["POST"]),
     Route("/v1/video/generations/{generation_id:str}", get_video, methods=["GET"]),
     Route("/health", lambda _: JSONResponse({"status": "ok"}), methods=["GET"]),
+    WebSocketRoute("/ws", proxy_ws),
     Route("/{path:path}", proxy_all, methods=[
         "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD",
     ]),
