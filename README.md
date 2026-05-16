@@ -12,6 +12,12 @@ modal-collections/
 ├── vllm/            # vLLM LLM inference (OpenAI-compatible API)
 │   ├── serve.py
 │   └── README.md
+├── comfyui/         # ComfyUI with modular plugins + video API
+│   ├── comfyui.py
+│   ├── models_example.py
+│   ├── plugins_example.py
+│   ├── workflows.py
+│   └── workflows/
 └── README.md
 ```
 
@@ -73,6 +79,32 @@ The app stays running and auto-scales. You get a stable URL for any web endpoint
 | `modal app list` | List running apps |
 | `modal app stop <name>` | Stop a deployed app |
 | `modal volume ls wan2gp-data` | Inspect persistent volume contents |
+
+## App: ComfyUI
+
+ComfyUI with modular plugin/model management, GPU snapshots, and an OpenAI-compatible video generation API. Pre-configured for the VideoFlow LTX 2.3 All-in-One v3.0 workflow.
+
+- **Image**: Debian slim + comfy-cli + starlette proxy
+- **GPU**: L40S (48 GB VRAM)
+- **Model**: LTX 2.3 fp8 checkpoint (~29 GB) + text encoders + VAEs
+- **Storage**: `hf-hub-cache` Modal Volume (models persist across restarts)
+- **Endpoint**: ComfyUI UI proxied on port 8000, video API at `/v1/video/generations`
+
+### Quick start
+
+```bash
+# Copy configs
+cp comfyui/models_example.py comfyui/models.py
+cp comfyui/plugins_example.py comfyui/plugins.py
+
+# Deploy
+modal deploy comfyui/comfyui.py
+
+# Test
+modal run comfyui/comfyui.py --prompt "A cinematic sunset time-lapse"
+```
+
+See [`comfyui/README.md`](comfyui/README.md) for full configuration details.
 
 ## App: Wan2GP
 

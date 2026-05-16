@@ -1,0 +1,5 @@
+comfy-cli
+huggingface_hub
+starlette
+httpx
+uvicorn

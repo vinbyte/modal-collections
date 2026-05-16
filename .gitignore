@@ -1,2 +1,6 @@
 .venv/
 __pycache__
+comfyui/models.py
+comfyui/plugins.py
+comfyui/comfy_config.py
+.ruff_cache
