@@ -128,13 +128,18 @@ def hf_download(repo_id: str, filename: str, model_dir: str) -> None:
 
 def url_download(url: str, filename: str, model_dir: str) -> None:
     """Download a model from a direct URL via aria2c and symlink to target dir."""
-    cached = Path(VOL_MOUNT) / filename
+    import hashlib
+    # Use URL hash to avoid filename collisions between different URLs
+    url_hash = hashlib.sha256(url.encode()).hexdigest()[:12]
+    cache_dir = Path(VOL_MOUNT) / "ext" / url_hash
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cached = cache_dir / filename
     if not cached.exists():
         logger.info("downloading %s from %s ...", filename, url)
         subprocess.run(
             [
                 "aria2c", "--console-log-level=error", "--summary-interval=0",
-                "-x", "16", "-s", "16", "-o", filename, "-d", VOL_MOUNT, url,
+                "-x", "16", "-s", "16", "-o", filename, "-d", str(cache_dir), url,
             ],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
@@ -144,11 +149,15 @@ def url_download(url: str, filename: str, model_dir: str) -> None:
 
 def _symlink_model(source: str, filename: str, model_dir: str) -> None:
     """Create a symlink from the cached model to its ComfyUI model directory."""
+    import shutil
     target_dir = resolve_model_dir(model_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / Path(filename).name
     if target.exists() or target.is_symlink():
-        target.unlink()
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
     target.symlink_to(source)
 
 
@@ -382,12 +391,11 @@ class ComfyUI:
 
     @modal.web_server(PROXY_PORT, startup_timeout=STARTUP_TIMEOUT)
     def proxy(self) -> None:
-        """Run the starlette proxy + video API server on the exposed port."""
-        logger.info(
-            "=== proxy server on port %d (comfy backend: %d) ===",
-            PROXY_PORT, COMFY_PORT,
-        )
-        _run_proxy_server()
+        """Placeholder — proxy runs as subprocess from start_checkpoint."""
+        import time
+        logger.info("=== proxy web_server active ===")
+        while True:
+            time.sleep(86400)
 
     @modal.exit()
     def cleanup(self) -> None:
@@ -407,7 +415,7 @@ class ComfyUI:
         """Launch ComfyUI server on the internal port."""
         logger.info("starting ComfyUI on port %d ...", COMFY_PORT)
         self.comfy_proc = subprocess.Popen(
-            f"comfy launch --background -- --listen 0.0.0.0 --port {COMFY_PORT}",
+            f"comfy launch -- --listen 0.0.0.0 --port {COMFY_PORT}",
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -555,7 +563,7 @@ def _ui_to_api(ui_workflow):
 
         for idx, inp in enumerate(node_inputs):
             name = inp["name"]
-            slot = idx if not isinstance(idx, int) else idx
+            slot = idx
 
             if (node["id"], slot) in link_map:
                 src_id, src_slot = link_map[(node["id"], slot)]
@@ -653,7 +661,14 @@ async def create_video(request):
     if not prompt_id:
         return JSONResponse({"error": "no prompt_id from ComfyUI"}, status_code=502)
 
-    video = await _poll(prompt_id, timeout=body.get("timeout", 600))
+    # Validate and clamp timeout
+    raw_timeout = body.get("timeout", 600)
+    try:
+        timeout = max(10, min(int(raw_timeout), 3600))
+    except (TypeError, ValueError):
+        timeout = 600
+
+    video = await _poll(prompt_id, timeout=timeout)
 
     files = video.get("files", [])
     for f in files:
@@ -685,17 +700,26 @@ async def get_video(request):
 
 async def _poll(prompt_id, timeout=600):
     deadline = time.time() + timeout
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    client = httpx.AsyncClient(timeout=10.0)
+    try:
         while time.time() < deadline:
             resp = await client.get(f"{COMFY_URL}/history/{prompt_id}")
             if resp.status_code == 200:
                 data = resp.json()
                 if prompt_id in data:
-                    outputs = data[prompt_id].get("outputs", {})
+                    entry = data[prompt_id]
+                    # Check for ComfyUI errors
+                    status_meta = entry.get("status", {})
+                    if status_meta.get("status") == "error":
+                        error_msg = status_meta.get("messages", ["unknown error"])[0]
+                        return {"status": "failed", "error": error_msg, "files": []}
+                    outputs = entry.get("outputs", {})
                     files = _extract_files(outputs)
                     if files:
                         return {"status": "completed", "files": files}
             await asyncio.sleep(2)
+    finally:
+        await client.aclose()
     return {"status": "processing", "files": []}
 
 
@@ -719,7 +743,7 @@ async def proxy_all(request):
 
     r_headers = {
         k: v for k, v in resp.headers.items()
-        if k.lower() not in ("transfer-encoding",)
+        if k.lower() not in ("transfer-encoding", "content-length")
     }
 
     return StreamingResponse(
