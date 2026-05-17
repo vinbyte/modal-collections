@@ -338,6 +338,16 @@ def _hf_secrets() -> list[modal.Secret]:
 
 image = modal.Image.debian_slim(python_version="3.12")
 
+def _install_all_git_plugins() -> None:
+    """Build-time helper: install all git-based plugins."""
+    for p in PLUGINS_GIT:
+        install_git_plugin(
+            url=p["url"],
+            branch=p.get("branch", "main"),
+            requirements=p.get("requirements", False),
+        )
+
+
 # Layer 1: base system + ComfyUI
 image = (
     image
@@ -381,16 +391,6 @@ if (ROOT_DIR / "workflows").is_dir():
     image = image.add_local_dir(
         str(ROOT_DIR / "workflows"), "/root/workflows", copy=True
     )
-
-
-def _install_all_git_plugins() -> None:
-    """Build-time helper: install all git-based plugins."""
-    for p in PLUGINS_GIT:
-        install_git_plugin(
-            url=p["url"],
-            branch=p.get("branch", "main"),
-            requirements=p.get("requirements", False),
-        )
 
 
 # Layer 3: download models into volume

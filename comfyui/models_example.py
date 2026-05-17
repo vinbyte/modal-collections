@@ -62,6 +62,12 @@ MODELS_HF = [
         "filename": "ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
         "model_dir": "latent_upscale_models",
     },
+    # ── Workflow-required diffusion model variant ─────────────────
+    {
+        "repo_id": "Kijai/LTX2.3_comfy",
+        "filename": "diffusion_models/ltx-2.3-22b-distilled-1.1_transformer_only_mxfp8_block32.safetensors",
+        "model_dir": "diffusion_models",
+    },
 ]
 
 MODELS_URL = [

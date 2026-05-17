@@ -21,16 +21,21 @@ PLUGINS_REGISTRY = [
     "comfyui-impact-pack",
     "comfyui-kjnodes",
     "comfyui-videohelpersuite",
+    # ── Additional packs reported as missing by workflow checker ──
+    "comfyui_essentials",
+    "comfyui-easy-use",
+    "comfyui-frame-interpolation",
+    "comfyui-unload-model",
+    "was-ns",
     # ── Add more comfy-cli node IDs here ──
 ]
 
 PLUGINS_GIT = [
-    # Plugins installed via git clone + optional pip install.
-    # {
-    #     "url": "https://github.com/user/custom-node-repo",
-    #     "branch": "main",
-    #     "requirements": True,   # run pip install -r requirements.txt
-    # },
+    {
+        "url": "https://github.com/ClownsharkBatwing/RES4LYF",
+        "branch": "main",
+        "requirements": True,
+    },
 ]
 
 PLUGINS_PIP = [
