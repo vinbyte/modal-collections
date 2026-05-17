@@ -70,6 +70,11 @@ VOL_MOUNT = "/cache"
 ENABLE_MEMORY_SNAPSHOT = True
 ENABLE_GPU_SNAPSHOT = True
 
+# ComfyUI-Manager policy (enables Install All from UI).
+# WARNING: weak security level allows broader plugin installation.
+MANAGER_SECURITY_LEVEL = "weak"
+MANAGER_NETWORK_MODE = "private"
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Import user configs (gracefully handle missing files at module level)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -220,6 +225,70 @@ def _log_gpu_info() -> None:
         logger.error("nvidia-smi not found — no GPU detected!")
     except Exception as e:
         logger.warning("could not query GPU info: %s", e)
+
+
+def _configure_manager_security() -> None:
+    """Configure ComfyUI-Manager security at runtime.
+
+    We set security_level=weak + appropriate network_mode in config.ini so the
+    manager reads our values at import time. ComfyUI is launched with
+    --listen 127.0.0.1 which makes is_local_mode=True, allowing weak security
+    even without the INI file (belt-and-suspenders).
+    """
+    from configparser import ConfigParser
+
+    manager_pkg = COMFY_ROOT / "custom_nodes" / "ComfyUI-Manager"
+    if not (manager_pkg / "__init__.py").exists():
+        logger.warning("ComfyUI-Manager not found at %s — skipping config", manager_pkg)
+        return
+
+    try:
+        ver_line = (manager_pkg / "glob" / "manager_core.py").read_text()
+        import re
+        m = re.search(r"version_code\s*=\s*\[(\d+),\s*(\d+)", ver_line)
+        if m:
+            mgr_ver = (int(m.group(1)), int(m.group(2)))
+            uses_private = mgr_ver >= (3, 32)
+        else:
+            mgr_ver = None
+            uses_private = False
+    except Exception:
+        mgr_ver = None
+        uses_private = False
+
+    network_mode = "private" if uses_private else "personal_cloud"
+    logger.info(
+        "manager version %s — using network_mode=%s",
+        f"V{mgr_ver[0]}.{mgr_ver[1]}" if mgr_ver else "unknown",
+        network_mode,
+    )
+
+    cfg_paths = [
+        COMFY_ROOT / "user" / "default" / "ComfyUI-Manager" / "config.ini",
+        COMFY_ROOT / "custom_nodes" / "ComfyUI-Manager" / "config.ini",
+    ]
+
+    for cfg in cfg_paths:
+        try:
+            cfg.parent.mkdir(parents=True, exist_ok=True)
+            p = ConfigParser()
+            if cfg.exists():
+                p.read(cfg)
+
+            if "default" not in p:
+                p["default"] = {}
+            p["default"]["security_level"] = MANAGER_SECURITY_LEVEL
+            p["default"]["network_mode"] = network_mode
+
+            with cfg.open("w") as f:
+                p.write(f)
+
+            logger.info(
+                "manager config written: %s [default] security_level=%s network_mode=%s",
+                cfg, MANAGER_SECURITY_LEVEL, network_mode,
+            )
+        except Exception as e:
+            logger.warning("failed to write manager config %s: %s", cfg, e)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -428,9 +497,10 @@ class ComfyUI:
 
     def _start_comfy(self) -> None:
         """Launch ComfyUI server on the internal port."""
+        _configure_manager_security()
         logger.info("starting ComfyUI on port %d ...", COMFY_PORT)
         self.comfy_proc = subprocess.Popen(
-            f"comfy launch -- --listen 0.0.0.0 --port {COMFY_PORT}",
+            f"comfy launch -- --listen 127.0.0.1 --port {COMFY_PORT}",
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -747,8 +817,6 @@ async def proxy_all(request):
     if qs:
         url = url + "?" + qs
 
-    # Preserve Host/Origin chain for ComfyUI security checks.
-    # ComfyUI can return 403 for static assets when Host/Origin mismatch.
     headers = {
         k: v for k, v in request.headers.items()
         if k.lower() not in ("connection", "transfer-encoding", "content-length")
@@ -756,26 +824,40 @@ async def proxy_all(request):
     headers["X-Forwarded-Host"] = request.headers.get("host", "")
     headers["X-Forwarded-Proto"] = request.url.scheme
 
-    # Only read body for methods that send one
     body = await request.body() if request.method in ("POST", "PUT", "PATCH") else None
 
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        req = client.build_request(
-            request.method, url, headers=headers, content=body,
-        )
-        resp = await client.send(req)
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                req = client.build_request(
+                    request.method, url, headers=headers, content=body,
+                )
+                resp = await client.send(req)
 
-    r_headers = {
-        k: v for k, v in resp.headers.items()
-        if k.lower() not in ("transfer-encoding", "content-length", "content-encoding")
-    }
+            r_headers = {
+                k: v for k, v in resp.headers.items()
+                if k.lower() not in ("transfer-encoding", "content-length", "content-encoding")
+            }
 
-    return StreamingResponse(
-        resp.aiter_bytes(),
-        status_code=resp.status_code,
-        headers=r_headers,
-        media_type=resp.headers.get("content-type"),
-    )
+            return StreamingResponse(
+                resp.aiter_bytes(),
+                status_code=resp.status_code,
+                headers=r_headers,
+                media_type=resp.headers.get("content-type"),
+            )
+        except httpx.ConnectError:
+            if attempt < 2:
+                await asyncio.sleep(1 * (attempt + 1))
+                continue
+            return JSONResponse(
+                {"error": "ComfyUI is unavailable", "detail": "Connection refused — ComfyUI may be restarting"},
+                status_code=502,
+            )
+        except httpx.ReadTimeout:
+            return JSONResponse(
+                {"error": "ComfyUI timeout", "detail": "Upstream request timed out"},
+                status_code=504,
+            )
 
 
 async def proxy_ws(websocket: WebSocket):
