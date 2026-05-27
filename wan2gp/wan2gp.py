@@ -46,6 +46,7 @@ WAN2GP_PROFILE = "1"  # offloading profile: 1 = high VRAM
 STARTUP_TIMEOUT = 300  # seconds Modal waits for the container to be ready
 GRADIO_SHARE = True  # create a public *.gradio.live tunnel URL
 ENABLE_MEMORY_SNAPSHOT = True  # enable Modal memory snapshotting for faster restarts
+ENABLE_GPU_SNAPSHOT = True  # enable GPU memory snapshotting (10x faster cold boots)
 
 # ── Paths ───────────────────────────────────────────────────────────────────
 WAN2GP_ROOT = "/root/Wan2GP"  # cloned repo location inside container
@@ -109,23 +110,29 @@ app = modal.App("wan2gp")
     timeout=TIMEOUT,
     min_containers=1,  # always keep 1 container running so Gradio share URL stays alive
     enable_memory_snapshot=ENABLE_MEMORY_SNAPSHOT,
+    experimental_options={"enable_gpu_snapshot": ENABLE_GPU_SNAPSHOT},
 )
 @modal.concurrent(max_inputs=MAX_CONCURRENT_INPUTS)
 class Wan2GP:
     """Modal class that runs Wan2GP's Gradio interface.
 
     Lifecycle:
-      1. @modal.enter() setup() — prepare volumes, env vars
-      2. @modal.web_server() launch() — start wgp.py as a subprocess
-      3. User accesses the app via the Gradio share URL (*.gradio.live)
-         printed in the container logs (NOT the Modal URL)
+      1. @modal.enter(snap=True)  start_checkpoint() — volume prep, env vars,
+         launch Gradio subprocess, wait for models, take GPU snapshot
+      2. @modal.enter(snap=False) start_restore() — kill frozen Gradio,
+         restart it (asyncio event loops stall after GPU snapshot restore)
+      3. @modal.web_server(7860)  serve() — placeholder, Gradio runs as subprocess
+      4. @modal.exit()            cleanup() — terminate Gradio subprocess
+
+    User accesses the app via the Gradio share URL (*.gradio.live) printed in
+    the container logs (NOT the Modal URL).
     """
 
-    @modal.enter()
-    def setup(self):
-        """Run once when a new container starts. Prepares the environment."""
+    @modal.enter(snap=True)
+    def start_checkpoint(self):
+        """Cold start: prepare environment, launch Gradio, take GPU snapshot."""
         t_start = time.monotonic()
-        logger.info("=== Wan2GP container startup ===")
+        logger.info("=== Wan2GP GPU snapshot cold start ===")
         logger.info(
             "PyTorch %s | torchvision %s | torchaudio %s | xformers %s",
             TORCH_VERSION,
@@ -148,25 +155,45 @@ class Wan2GP:
         wan2gp_volume.commit()
         logger.info("Volume committed successfully")
 
-        # Disable Gradio telemetry
         os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
 
+        self._launch_gradio()
+
         elapsed = time.monotonic() - t_start
-        logger.info("=== Setup complete in %.1fs ===", elapsed)
+        logger.info("=== cold start complete in %.1fs ===", elapsed)
+
+    @modal.enter(snap=False)
+    def start_restore(self):
+        """Warm start: restart Gradio after GPU snapshot restore.
+
+        GPU snapshots can leave asyncio-based subprocesses (Gradio/uvicorn)
+        in a frozen state — event loop stalls. We kill the frozen process
+        and restart it. Model weights survive in GPU memory if the underlying
+        Wan2GP inference process is separate from the asyncio server layer.
+        """
+        logger.info("=== Wan2GP restore from GPU snapshot ===")
+        self._terminate_gradio()
+        self._launch_gradio()
+        logger.info("=== restore complete ===")
 
     @modal.web_server(GRADIO_PORT, startup_timeout=STARTUP_TIMEOUT)
-    def launch(self):
+    def serve(self):
+        """Placeholder — Gradio runs as a subprocess from start_checkpoint."""
+        logger.info("=== Gradio web_server active ===")
+
+    @modal.exit()
+    def cleanup(self):
+        """Terminate Gradio subprocess."""
+        self._terminate_gradio()
+
+    # ── Gradio subprocess management ───────────────────────────────────────
+
+    def _launch_gradio(self):
         """Start wgp.py as a subprocess with Gradio's --share flag.
 
         Gradio's --share creates a public tunnel URL (*.gradio.live) that
         connects directly to the Gradio server without going through Modal's
-        HTTP reverse proxy. This avoids Content-Length mismatch errors that
-        occur when Gradio streams responses (SSE, progressive loading, file
-        uploads) through the proxy.
-
-        The Modal URL still works as a fallback, but may encounter the
-        proxy-related errors. Always use the Gradio share URL for the best
-        experience. The URL is printed in the container logs after startup.
+        HTTP reverse proxy.
         """
         logger.info(
             "=== Launching Wan2GP Gradio on port %d (startup_timeout=%ds) ===",
@@ -177,35 +204,47 @@ class Wan2GP:
 
         cmd = [
             sys.executable,
-            "-u",  # unbuffered stdout/stderr for real-time logging
+            "-u",
             "wgp.py",
-            "--listen",  # bind to 0.0.0.0
+            "--listen",
             "--server-port",
             str(GRADIO_PORT),
             "--profile",
             WAN2GP_PROFILE,
         ]
-        # --share creates a public *.gradio.live tunnel URL that bypasses
-        # Modal's HTTP proxy, avoiding Content-Length mismatch on streaming
         if GRADIO_SHARE:
             cmd.append("--share")
 
         logger.info("Command: %s", " ".join(cmd))
 
-        proc = subprocess.Popen(
+        self.gradio_proc = subprocess.Popen(
             cmd,
             cwd=WAN2GP_ROOT,
             env=self.env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1,  # line-buffered for real-time log streaming
+            bufsize=1,
         )
-        logger.info("wgp.py PID: %d", proc.pid)
+        logger.info("wgp.py PID: %d", self.gradio_proc.pid)
 
-        # Stream wgp.py output to structured logs so Gradio share URL,
-        # errors, and model loading progress are visible in Modal logs
-        self._stream_wgp_output(proc)
+        self._stream_wgp_output(self.gradio_proc)
+
+    def _terminate_gradio(self):
+        """Kill the frozen Gradio subprocess from a previous snapshot."""
+        proc = getattr(self, "gradio_proc", None)
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+                logger.info("Terminated old Gradio process (PID: %d)", proc.pid)
+            except (ProcessLookupError, OSError, subprocess.TimeoutExpired):
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    # ── Log streaming ──────────────────────────────────────────────────────
 
     def _stream_wgp_output(self, proc):
         """Stream subprocess output to structured logs in a daemon thread.

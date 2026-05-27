@@ -47,6 +47,8 @@ SCALEDOWN_WINDOW = 900  # seconds to stay up with no requests (15 min)
 STARTUP_TIMEOUT = 600  # seconds Modal waits for the container to be ready
 MAX_CONCURRENT_INPUTS = 100  # max concurrent requests per container replica
 VLLM_PORT = 8000  # port vLLM listens on inside the container
+ENABLE_MEMORY_SNAPSHOT = True  # enable Modal memory snapshotting for faster restarts
+ENABLE_GPU_SNAPSHOT = True  # enable GPU memory snapshotting (10x faster cold boots)
 
 # ── Model config ────────────────────────────────────────────────────────────
 MODEL_NAME = "cyankiwi/Qwen3.6-27B-AWQ-INT4"
@@ -90,7 +92,7 @@ vllm_cache_vol = modal.Volume.from_name(VLLM_CACHE_VOL_NAME, create_if_missing=T
 app = modal.App("vllm-inference")
 
 
-@app.function(
+@app.cls(
     image=vllm_image,
     gpu=f"{GPU_TYPE}:{N_GPU}",
     scaledown_window=SCALEDOWN_WINDOW,
@@ -100,89 +102,144 @@ app = modal.App("vllm-inference")
         VLLM_CACHE_MOUNT: vllm_cache_vol,
     },
     min_containers=MIN_CONTAINERS,
+    enable_memory_snapshot=ENABLE_MEMORY_SNAPSHOT,
+    experimental_options={"enable_gpu_snapshot": ENABLE_GPU_SNAPSHOT},
 )
 @modal.concurrent(max_inputs=MAX_CONCURRENT_INPUTS)
-@modal.web_server(port=VLLM_PORT, startup_timeout=STARTUP_TIMEOUT)
-def serve():
-    """Start the vLLM OpenAI-compatible server as a subprocess.
+class VLLM:
+    """Modal class that runs vLLM as an OpenAI-compatible inference server.
 
-    The server exposes:
-      - POST /v1/chat/completions  — chat completion (streaming supported)
-      - POST /v1/completions       — text completion
-      - GET  /v1/models            — list available models
-      - GET  /health               — health check
-
-    Once deployed, Modal provides a stable URL. You can use any OpenAI-compatible
-    client (openai SDK, curl, etc.) to interact with it.
+    Lifecycle:
+      1. @modal.enter(snap=True)  start_checkpoint() — log GPU info,
+         launch vLLM serve subprocess, wait for model load, take GPU snapshot
+      2. @modal.enter(snap=False) start_restore() — kill frozen vLLM server,
+         restart it (uvicorn/starlette asyncio event loops stall after restore)
+      3. @modal.web_server(8000)  serve() — placeholder, vLLM runs as subprocess
+      4. @modal.exit()            cleanup() — terminate vLLM subprocess
     """
-    t_start = time.monotonic()
-    logger.info("=== vLLM server startup ===")
-    logger.info(
-        "Model: %s | GPU: %s x %d | Max ctx: %d tokens",
-        MODEL_NAME,
-        GPU_TYPE,
-        N_GPU,
-        MAX_MODEL_LEN,
-    )
-    logger.info(
-        "Fast boot: %s | Reasoning parser: %s | Port: %d",
-        FAST_BOOT,
-        REASONING_PARSER,
-        VLLM_PORT,
-    )
-    _log_gpu_info()
 
-    cmd = [
-        "vllm",
-        "serve",
-        MODEL_NAME,
-        "--host",
-        "0.0.0.0",
-        "--port",
-        str(VLLM_PORT),
-        "--tensor-parallel-size",
-        str(N_GPU),
-        "--max-model-len",
-        str(MAX_MODEL_LEN),
-        "--uvicorn-log-level",
-        "info",
-        "--async-scheduling",
-    ]
+    @modal.enter(snap=True)
+    def start_checkpoint(self):
+        """Cold start: launch vLLM server, wait for model load, take GPU snapshot."""
+        t_start = time.monotonic()
+        logger.info("=== vLLM GPU snapshot cold start ===")
+        logger.info(
+            "Model: %s | GPU: %s x %d | Max ctx: %d tokens",
+            MODEL_NAME,
+            GPU_TYPE,
+            N_GPU,
+            MAX_MODEL_LEN,
+        )
+        logger.info(
+            "Fast boot: %s | Reasoning parser: %s | Port: %d",
+            FAST_BOOT,
+            REASONING_PARSER,
+            VLLM_PORT,
+        )
+        _log_gpu_info()
+        self._launch_vllm()
 
-    if MODEL_REVISION:
-        cmd += ["--revision", MODEL_REVISION]
+        elapsed = time.monotonic() - t_start
+        logger.info("=== cold start complete in %.1fs ===", elapsed)
 
-    if FAST_BOOT:
-        cmd += ["--enforce-eager"]
-    else:
-        cmd += ["--no-enforce-eager"]
+    @modal.enter(snap=False)
+    def start_restore(self):
+        """Warm start: restart vLLM after GPU snapshot restore.
 
-    if REASONING_PARSER:
-        cmd += ["--reasoning-parser", REASONING_PARSER]
+        GPU snapshots can leave asyncio-based subprocesses (uvicorn/starlette)
+        in a frozen state — the TCP socket stays open but the event loop stalls.
+        We kill the frozen vLLM server and restart it. Even with a restart,
+        the snapshot preserves filesystem cache, Python pre-imports, and GPU
+        state, making the restart significantly faster than a cold boot.
+        """
+        logger.info("=== vLLM restore from GPU snapshot ===")
+        self._terminate_vllm()
+        self._launch_vllm()
+        logger.info("=== restore complete ===")
 
-    if LANGUAGE_MODEL_ONLY:
-        cmd += ["--language-model-only"]
+    @modal.web_server(port=VLLM_PORT, startup_timeout=STARTUP_TIMEOUT)
+    def serve(self):
+        """Placeholder — vLLM runs as a subprocess from start_checkpoint."""
+        logger.info("=== vLLM web_server active ===")
 
-    if ENABLE_AUTO_TOOL_CHOICE:
-        cmd += ["--enable-auto-tool-choice"]
-        if TOOL_CALL_PARSER:
-            cmd += ["--tool-call-parser", TOOL_CALL_PARSER]
+    @modal.exit()
+    def cleanup(self):
+        """Terminate vLLM subprocess."""
+        self._terminate_vllm()
 
-    logger.info("Command: %s", " ".join(cmd))
+    # ── vLLM subprocess management ─────────────────────────────────────────
 
-    proc = subprocess.Popen(
-        " ".join(cmd),
-        shell=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-    logger.info("vLLM PID: %d", proc.pid)
-    _stream_output(proc)
+    def _launch_vllm(self):
+        """Start vLLM OpenAI-compatible server as a subprocess.
 
-    elapsed = time.monotonic() - t_start
-    logger.info("=== vLLM serve() returned in %.1fs ===", elapsed)
+        The server exposes:
+          - POST /v1/chat/completions  — chat completion (streaming supported)
+          - POST /v1/completions       — text completion
+          - GET  /v1/models            — list available models
+          - GET  /health               — health check
+        """
+        cmd = [
+            "vllm",
+            "serve",
+            MODEL_NAME,
+            "--host",
+            "0.0.0.0",
+            "--port",
+            str(VLLM_PORT),
+            "--tensor-parallel-size",
+            str(N_GPU),
+            "--max-model-len",
+            str(MAX_MODEL_LEN),
+            "--uvicorn-log-level",
+            "info",
+            "--async-scheduling",
+        ]
+
+        if MODEL_REVISION:
+            cmd += ["--revision", MODEL_REVISION]
+
+        if FAST_BOOT:
+            cmd += ["--enforce-eager"]
+        else:
+            cmd += ["--no-enforce-eager"]
+
+        if REASONING_PARSER:
+            cmd += ["--reasoning-parser", REASONING_PARSER]
+
+        if LANGUAGE_MODEL_ONLY:
+            cmd += ["--language-model-only"]
+
+        if ENABLE_AUTO_TOOL_CHOICE:
+            cmd += ["--enable-auto-tool-choice"]
+            if TOOL_CALL_PARSER:
+                cmd += ["--tool-call-parser", TOOL_CALL_PARSER]
+
+        logger.info("Command: %s", " ".join(cmd))
+
+        self.vllm_proc = subprocess.Popen(
+            " ".join(cmd),
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        logger.info("vLLM PID: %d", self.vllm_proc.pid)
+        _stream_output(self.vllm_proc)
+
+    def _terminate_vllm(self):
+        """Kill the frozen vLLM subprocess from a previous snapshot."""
+        proc = getattr(self, "vllm_proc", None)
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=10)
+                logger.info("Terminated old vLLM process (PID: %d)", proc.pid)
+            except (ProcessLookupError, OSError, subprocess.TimeoutExpired):
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
 
 # ── Local entrypoint (testing) ──────────────────────────────────────────────
@@ -195,12 +252,12 @@ async def main(
     """Test the deployed server by sending a chat completion request.
 
     Usage:
-      modal run vllm/vllm.py
-      modal run vllm/vllm.py --content "What is the meaning of life?"
+      modal run vllm/serve.py
+      modal run vllm/serve.py --content "What is the meaning of life?"
     """
     import aiohttp
 
-    url = await serve.get_web_url.aio()
+    url = await VLLM.serve.get_web_url.aio()
     logger.info("Server URL: %s", url)
 
     messages = [
