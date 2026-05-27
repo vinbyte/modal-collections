@@ -24,6 +24,7 @@ import json
 import logging
 import subprocess
 import time
+import urllib.request
 
 import modal
 
@@ -171,6 +172,7 @@ class LlamaCpp:
             "--cache-type-v", CACHE_TYPE_V,
             "--reasoning-format", REASONING_FORMAT,
             "--log-verbose",
+            "--reuse-port",
         ]
 
         if HF_FILE:
@@ -218,16 +220,20 @@ class LlamaCpp:
     def _terminate_server(self):
         """Kill the frozen llama-server subprocess from a previous snapshot."""
         proc = getattr(self, "server_proc", None)
-        if proc is not None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=10)
-                logger.info("Terminated old llama-server (PID: %d)", proc.pid)
-            except (ProcessLookupError, OSError, subprocess.TimeoutExpired):
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+        if proc is None or proc.poll() is not None:
+            return  # already dead or never started
+
+        logger.info("Terminating llama-server (PID: %d)...", proc.pid)
+        try:
+            proc.terminate()
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            logger.warning("SIGTERM timed out, sending SIGKILL to PID: %d", proc.pid)
+            proc.kill()
+            proc.wait(timeout=5)
+        except (ProcessLookupError, OSError):
+            pass  # already dead
+        logger.info("llama-server terminated (PID: %d)", proc.pid)
 
 
 # ── Local entrypoint (testing) ──────────────────────────────────────────────
@@ -297,29 +303,42 @@ async def main(
 
 
 def _wait_until_ready(proc):
-    """Read subprocess stdout until the model is loaded, then keep streaming in background."""
+    """Poll /health endpoint until the model is loaded and server is ready."""
     import threading
+    import urllib.request
 
-    ready = threading.Event()
+    dead = threading.Event()
 
-    def _reader():
+    def _stream():
         for line in proc.stdout:
             line = line.rstrip()
-            if not line:
-                continue
-            logger.info("LLAMACPP: %s", line)
-            if any(kw in line.lower() for kw in ("server is listening", "http server listening")):
-                ready.set()
-        ready.set()  # process exited or stdout closed — unblock caller
+            if line:
+                logger.info("LLAMACPP: %s", line)
+        dead.set()  # process exited
 
-    t = threading.Thread(target=_reader, daemon=True)
+    t = threading.Thread(target=_stream, daemon=True)
     t.start()
 
     logger.info("Waiting for llama-server to finish loading model...")
-    if not ready.wait(timeout=STARTUP_TIMEOUT):
-        logger.error("llama-server did not become ready within %ds", STARTUP_TIMEOUT)
-    else:
-        logger.info("llama-server is ready and listening")
+    deadline = time.monotonic() + STARTUP_TIMEOUT
+    while time.monotonic() < deadline:
+        if dead.is_set():
+            logger.error(
+                "llama-server exited prematurely (exit code: %s)",
+                proc.poll(),
+            )
+            return
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{LLAMACPP_PORT}/health")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    logger.info("llama-server is ready (health check passed)")
+                    return
+        except Exception:
+            pass
+        time.sleep(1)
+
+    logger.error("llama-server did not become ready within %ds", STARTUP_TIMEOUT)
 
 
 def _log_gpu_info():
