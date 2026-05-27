@@ -12,6 +12,8 @@ modal-collections/
 ├── vllm/            # vLLM LLM inference (OpenAI-compatible API)
 │   ├── serve.py
 │   └── README.md
+├── llamacpp/        # llama.cpp LLM inference (OpenAI-compatible API)
+│   └── serve.py
 ├── comfyui/         # ComfyUI with modular plugins + video API
 │   ├── comfyui.py
 │   ├── models_example.py
@@ -159,3 +161,26 @@ modal deploy vllm/serve.py
 ```
 
 See [`vllm/README.md`](vllm/README.md) for full API usage examples and configuration details.
+
+## App: llama.cpp
+
+OpenAI-compatible LLM inference server using llama.cpp, running Qwen3.5-9B Q4_K_M (4-bit quantized, ~5.6 GB) with flash attention, continuous batching, and KV cache quantization on an L4 GPU.
+
+- **Image**: ghcr.io/ggml-org/llama.cpp:server-cuda
+- **GPU**: L4 (16 GB VRAM)
+- **Model**: Jackrong/Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled-v2-GGUF (Q4_K_M, ~5.6 GB)
+- **Storage**: `huggingface-cache` Modal Volume (model weights persist across restarts)
+- **Endpoint**: OpenAI-compatible API on port 8080 (`/v1/chat/completions`, `/v1/completions`, `/v1/models`)
+
+### Quick test
+
+```bash
+modal run llamacpp/serve.py
+modal run llamacpp/serve.py --content "What is the meaning of life?"
+```
+
+### Deploy
+
+```bash
+modal deploy llamacpp/serve.py
+```
