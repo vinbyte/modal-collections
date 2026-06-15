@@ -14,6 +14,8 @@ modal-collections/
 │   └── README.md
 ├── llamacpp/        # llama.cpp LLM inference (OpenAI-compatible API)
 │   └── serve.py
+├── sglang/          # SGLang LLM inference (OpenAI-compatible API)
+│   └── serve.py
 ├── comfyui/         # ComfyUI with modular plugins + video API
 │   ├── comfyui.py
 │   ├── models_example.py
@@ -183,4 +185,29 @@ modal run llamacpp/serve.py --content "What is the meaning of life?"
 
 ```bash
 modal deploy llamacpp/serve.py
+```
+
+## App: SGLang
+
+OpenAI-compatible LLM inference server using SGLang, running Microsoft FastContext 1.0 4B SFT on an L40S GPU at the model's 262K context length.
+
+- **Image**: NVIDIA CUDA 12.9 + SGLang
+- **GPU**: L40S (48 GB VRAM)
+- **Model**: microsoft/FastContext-1.0-4B-SFT
+- **Storage**: `huggingface-cache` Modal Volume (model weights persist across restarts)
+- **Endpoint**: OpenAI-compatible API on port 30000 (`/v1/chat/completions`, `/v1/completions`, `/v1/models`)
+- **Context**: 262K tokens
+- **Tool calling**: enabled with SGLang `qwen` tool-call parser for FastContext READ/GLOB/GREP calls
+
+### Quick test
+
+```bash
+modal run sglang/serve.py
+modal run sglang/serve.py --content "What is the meaning of life?"
+```
+
+### Deploy
+
+```bash
+modal deploy sglang/serve.py
 ```
