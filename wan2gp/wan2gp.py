@@ -24,6 +24,8 @@ import shutil
 import subprocess
 import sys
 import time
+import json
+import urllib.request
 from pathlib import Path
 
 import modal
@@ -38,12 +40,21 @@ logger = logging.getLogger("wan2gp")
 # ── Runtime config ──────────────────────────────────────────────────────────
 # Available GPU types: T4, L4, A10, L40S, A100, A100-40GB, A100-80GB, RTX-PRO-6000, H100, H200, B200
 # See https://modal.com/pricing for details.
-GPU_TYPE = "L40S"
+GPU_TYPE = "H100"
 TIMEOUT = 3600  # max seconds a container stays alive
 MAX_CONCURRENT_INPUTS = 3  # max concurrent requests per container
 GRADIO_PORT = 7860  # port Gradio listens on inside the container
-WAN2GP_PROFILE = "1"  # offloading profile: 1 = high VRAM
-STARTUP_TIMEOUT = 300  # seconds Modal waits for the container to be ready
+# Available models (based on JSON files in Wan2GP/defaults/ directory):
+# - MiniMax H3: minimax_h3_fl2va, minimax_h3_fl2va_pruned, minimax_h3_ref2va, minimax_h3_ref2va_pruned
+# - Wan2.1 (T2V/I2V): t2v, i2v, i2v_720p
+# - Hunyuan: hunyuan, hunyuan_1_5_t2v, hunyuan_1_5_i2v
+# - LTX-Video: ltxv_13B, ltx2_22B
+# - Flux: flux, flux2_dev, flux_schnell
+WAN2GP_MODEL = "minimax_h3_fl2va"  # The model to preload into VRAM
+# The profile setting controls memory offloading and memory allocation.
+# Typical values: 1 (High VRAM), 2 (Low VRAM), etc.
+WAN2GP_PROFILE = "1"  # offloading profile (1 = high VRAM)
+STARTUP_TIMEOUT = 900  # seconds Modal waits for the container to be ready (increased for huge models)
 GRADIO_SHARE = True  # create a public *.gradio.live tunnel URL
 ENABLE_MEMORY_SNAPSHOT = True  # enable Modal memory snapshotting for faster restarts
 ENABLE_GPU_SNAPSHOT = True  # enable GPU memory snapshotting (10x faster cold boots)
@@ -102,7 +113,6 @@ wan2gp_volume = modal.Volume.from_name(VOL_NAME, create_if_missing=True)
 
 app = modal.App("wan2gp")
 
-
 @app.cls(
     image=wan2gp_image,
     gpu=GPU_TYPE,
@@ -157,7 +167,9 @@ class Wan2GP:
 
         os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
 
+        self._force_preload_config()
         self._launch_gradio()
+        self._wait_for_gradio()
 
         elapsed = time.monotonic() - t_start
         logger.info("=== cold start complete in %.1fs ===", elapsed)
@@ -187,6 +199,59 @@ class Wan2GP:
         self._terminate_gradio()
 
     # ── Gradio subprocess management ───────────────────────────────────────
+
+    def _force_preload_config(self):
+        """Force wgp.py to preload the model on startup instead of on first request."""
+        config_path = os.path.join(WAN2GP_ROOT, "wgp_config.json")
+        
+        # 1. Generate full default config if missing
+        if not os.path.exists(config_path):
+            logger.info("Initializing Wan2GP to generate default config...")
+            cmd = [sys.executable, "-u", "wgp.py", "--test"]
+            try:
+                init_proc = subprocess.Popen(
+                    cmd, cwd=WAN2GP_ROOT, env=self.env,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+                )
+                for line in init_proc.stdout:
+                    if "Running on local URL" in line:
+                        logger.info("Default config generated! Terminating init process...")
+                        init_proc.terminate()
+                        init_proc.wait(timeout=5)
+                        break
+            except Exception as e:
+                logger.error("Error during init process: %s", e)
+                if init_proc: init_proc.kill()
+        
+        # 2. Patch config
+        config = {}
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+            except Exception:
+                pass
+        
+        config["preload_model_policy"] = ["P"]
+        config["last_model_type"] = WAN2GP_MODEL
+        
+        with open(config_path, "w") as f:
+            json.dump(config, f)
+        logger.info("Updated wgp_config.json to preload model %s at startup", WAN2GP_MODEL)
+
+    def _wait_for_gradio(self):
+        """Wait for Gradio (and the preloaded model) to become ready before snapshotting."""
+        logger.info("Waiting for model to load and Gradio to bind to port %d...", GRADIO_PORT)
+        deadline = time.monotonic() + STARTUP_TIMEOUT
+        while time.monotonic() < deadline:
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{GRADIO_PORT}/", timeout=1)
+                logger.info("=== Gradio server is ready! Model is loaded into VRAM ===")
+                break
+            except Exception:
+                time.sleep(2)
+        else:
+            logger.warning("Gradio did not become ready in time. GPU snapshot may be incomplete.")
 
     def _launch_gradio(self):
         """Start wgp.py as a subprocess with Gradio's --share flag.
