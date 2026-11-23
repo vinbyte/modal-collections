@@ -42,7 +42,7 @@ logger = logging.getLogger("wan2gp")
 # See https://modal.com/pricing for details.
 GPU_TYPE = "H100"
 TIMEOUT = 3600  # max seconds a container stays alive
-MAX_CONCURRENT_INPUTS = 3  # max concurrent requests per container
+MAX_CONCURRENT_INPUTS = 1  # max concurrent requests per container
 GRADIO_PORT = 7860  # port Gradio listens on inside the container
 # Available models (based on JSON files in Wan2GP/defaults/ directory):
 # - MiniMax H3: minimax_h3_fl2va, minimax_h3_fl2va_pruned, minimax_h3_ref2va, minimax_h3_ref2va_pruned
@@ -50,7 +50,7 @@ GRADIO_PORT = 7860  # port Gradio listens on inside the container
 # - Hunyuan: hunyuan, hunyuan_1_5_t2v, hunyuan_1_5_i2v
 # - LTX-Video: ltxv_13B, ltx2_22B
 # - Flux: flux, flux2_dev, flux_schnell
-WAN2GP_MODEL = "minimax_h3_fl2va"  # The model to preload into VRAM
+WAN2GP_MODEL = "minimax_h3_ref2va"  # The model to preload into VRAM
 # The profile setting controls memory offloading and memory allocation.
 # Typical values: 1 (High VRAM), 2 (Low VRAM), etc.
 WAN2GP_PROFILE = "1"  # offloading profile (1 = high VRAM)
