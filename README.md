@@ -16,6 +16,10 @@ modal-collections/
 │   └── serve.py
 ├── sglang/          # SGLang LLM inference (OpenAI-compatible API)
 │   └── serve.py
+├── fish-speech/     # Fish Speech TTS + official Web UI + emotion controls
+│   ├── serve.py
+│   ├── emotion-examples.txt
+│   └── README.md
 ├── comfyui/         # ComfyUI with modular plugins + video API
 │   ├── comfyui.py
 │   ├── models_example.py
@@ -26,6 +30,19 @@ modal-collections/
 ```
 
 Every app folder contains its own `*.py` entrypoint and optionally a `.venv` for local development. There is no shared state between apps.
+
+## App: Fish Speech
+
+Fish Speech TTS with the official Awesome WebUI at `/ui`, reference voice uploads, multiple speakers, and inline emotion instructions such as `[whisper]`, `[laughing]`, and `[excited]`. Defaults to S2-Pro on one L40S; Drama 3 on one H100 is also available. Checkpoints persist in Modal Volumes, and the GPU scales to zero after five idle minutes.
+
+```bash
+modal run fish-speech/serve.py::download_model
+modal serve fish-speech/serve.py
+# Persistent deployment:
+modal deploy fish-speech/serve.py
+```
+
+Append `/ui` to the URL printed by Modal. See [`fish-speech/README.md`](fish-speech/README.md) for emotion examples, reference voices, API usage, and model selection.
 
 ## Prerequisites
 

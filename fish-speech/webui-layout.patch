@@ -1,0 +1,31 @@
+diff --git a/awesome_webui/src/App.tsx b/awesome_webui/src/App.tsx
+index ff03d14..94394ac 100644
+--- a/awesome_webui/src/App.tsx
++++ b/awesome_webui/src/App.tsx
+@@ -729,7 +729,7 @@ function App() {
+   return (
+     <main className="min-h-screen bg-zinc-50">
+       <div className="mx-auto max-w-[1600px] px-3 py-3 sm:px-4 lg:px-5">
+-        <div className="grid gap-4 xl:h-[calc(100vh-1.5rem)] xl:grid-cols-[minmax(0,1fr)_460px]">
++        <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_460px]">
+           <section className="grid gap-4 xl:min-h-0 xl:grid-rows-[minmax(0,1fr)_auto]">
+             <Card className="rounded-xl border-zinc-200 bg-white shadow-none xl:min-h-0 xl:flex xl:flex-col">
+               <CardHeader className="space-y-1 border-b border-zinc-100 px-4 py-4">
+@@ -898,7 +898,7 @@ function App() {
+             </Card>
+           </section>
+ 
+-          <aside className="grid gap-4 xl:min-h-0 xl:grid-rows-[minmax(0,1fr)_auto]">
++          <aside className="flex min-w-0 flex-col gap-4">
+             <Card className="rounded-xl border-zinc-200 bg-white shadow-none xl:min-h-0 xl:flex xl:flex-col">
+               <CardHeader className="space-y-1 border-b border-zinc-100 px-4 py-4">
+                 <div className="flex items-center gap-2 text-zinc-700">
+@@ -934,7 +934,7 @@ function App() {
+                   />
+                 </div>
+ 
+-                <ScrollArea className="min-h-0 rounded-md xl:h-full xl:flex-1">
++                <ScrollArea className="h-64 rounded-md">
+                   <div className="space-y-2">
+                     {speakerGroups.length > 0 ? (
+                       speakerGroups.map((speakerGroup, speakerIndex) => (

@@ -1,0 +1,37 @@
+# Paste one example at a time into the Web UI. Keep the same reference voice.
+# Tags are free-form model instructions; these examples are listening tests.
+
+# Neutral baseline
+Aku mau cerita sesuatu. Tadi aku bertemu teman lama, dan kami ngobrol sampai sore.
+
+# Whisper
+[whisper] Sini, aku mau cerita rahasia. Tapi jangan bilang siapa-siapa, ya.
+
+# Laughter
+[laughing] Serius? Kamu datang ke kantor pakai sandal yang beda warna?
+
+# Chuckle, then speech with a laughing tone
+[chuckle] [laughing tone] Aku sudah bilang, kucing itu pasti mencuri ikanmu lagi.
+
+# Sad
+[sad] Aku kira kita masih punya banyak waktu. Ternyata itu pertemuan terakhir kita.
+
+# Angry
+[angry] Aku sudah menunggu dua jam! Kenapa kamu baru memberi kabar sekarang?
+
+# Excited
+[excited] Akhirnya berhasil! Kita benar-benar menang! Aku nggak sabar cerita ke semuanya!
+
+# Sigh and pause
+[sigh] Hari ini panjang sekali. [pause] Aku cuma ingin pulang dan istirahat.
+
+# Compare English to Indonesian if a tag has a weak effect
+[whisper] Come closer. I have a secret, but you have to promise not to tell anyone.
+[laughing] You actually wore two different shoes to the meeting?
+
+# Several instructions in one take
+[whisper] Aku dengar suara dari dapur. [surprised] Ternyata kamu! [laughing] Kukira ada pencuri!
+
+# Two speakers: add a reference voice to speaker 0 and speaker 1 in the UI
+<|speaker:0|>[whisper] Kamu dengar sesuatu?
+<|speaker:1|>[laughing] Tenang, itu cuma kucingku.
